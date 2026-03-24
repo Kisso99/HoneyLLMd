@@ -40,7 +40,7 @@ import amun_logging
 from input_manager import split_commands
 
 ### DF: import LLM engine
-from core.llm_engine import LLMContextManager, API_KEY, MODEL, BASE_URL
+from llm_engine import LLMContextManager, API_KEY, MODEL, BASE_URL
 
 ### DF: import Blocker
 from blocker import Blocker
