@@ -1,5 +1,5 @@
 ### DF: blocker.py
-from core.matrix_manager import Matrix
+from matrix_manager import Matrix
 
 class Blocker:
     def __init__(self, counts_file="transition_counts_matrix.csv", probs_file="transition_probabilities_matrix.csv"):
