@@ -1,4 +1,5 @@
-from matrix_manager import Matrix
+# -*- coding: utf-8 -*-
+from core.matrix_manager import Matrix
 
 class Blocker:
     def __init__(self, counts_file="transition_counts_matrix.csv", probs_file="transition_probabilities_matrix.csv"):
@@ -13,41 +14,36 @@ class Blocker:
             return result
 
         src = self.matrix.last_command
-        probs_before_update = self.matrix.probs_df.copy()
 
-        # ====================== 核心正确逻辑 ======================
+        # ====================== 修复：不再使用 probs_df.copy() ======================
         if src == dst:
-            # 取矩阵里的实际概率
-            if src in probs_before_update.index and dst in probs_before_update.columns:
-                Pr_Actual = float(probs_before_update.loc[src, dst])
-            else:
+            # 重复命令：直接获取真实概率
+            Pr_Actual = self.matrix.find_optimal_pr(src, dst)
+            if Pr_Actual is None:
                 Pr_Actual = 0.0
 
-            Pr_Max = Pr_Actual   # 最大概率 = 实际概率
-            payoff = 1.0         # 收益固定 1
+            Pr_Max = Pr_Actual
+            payoff = 1.0
 
-            # 填充结果
             result.update({
                 "Pr_Actual": Pr_Actual,
                 "Pr_Max": Pr_Max,
                 "payoff": payoff,
-                "block": payoff > 0.5  # 1 > 0.5 → True → 会拦截
+                "block": payoff > 0.5
             })
 
             self.matrix.update_matrix(src, dst)
             self.matrix.last_command = dst
-
             return result
-        # ==========================================================
 
-        # 下面是 不同命令 才会执行的正常逻辑
-        if src in probs_before_update.index and dst in probs_before_update.columns:
-            Pr_Actual = float(probs_before_update.loc[src, dst])
-        else:
-            Pr_Actual = None
+        # 不同命令的正常逻辑
+        Pr_Actual = self.matrix.find_optimal_pr(src, dst)
+        Pr_Max = self.matrix.find_optimal_pr(src, dst)
 
-        Pr_Max_raw = self.matrix.find_optimal_pr(src, dst, probs_before_update)
-        Pr_Max = float(Pr_Max_raw) if Pr_Max_raw is not None else None
+        if Pr_Actual is None:
+            Pr_Actual = 0.0
+        if Pr_Max is None:
+            Pr_Max = 0.0
 
         payoff = self.calc_payoff(Pr_Actual, Pr_Max)
 
