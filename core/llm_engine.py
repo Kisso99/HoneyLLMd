@@ -14,10 +14,10 @@ if sys.version_info[0] < 3:
     if hasattr(sys, 'setdefaultencoding'):
         sys.setdefaultencoding('utf-8')
 
-### DF: define the LLM info
-API_KEY = "sk-i2GQTkZ4h1XuFaYtPmMEAziCNZNY0zfcNCTQwwhDVy7lSJdp"
-BASE_URL = "https://api.chatanywhere.tech"
-MODEL = "gpt-4o-mini"
+### DF: define the LLM info (已改为 DeepSeek 官方)
+API_KEY = "sk-e71a20afce3c44dfbe0d057fef7764e4"  # 👈 你的 token
+BASE_URL = "https://api.deepseek.com"  # 👈 DeepSeek 官方地址
+MODEL = "deepseek-chat"  # 👈 模型固定
 LLM_PROMPT = "You are a shell with system information Linux can201-VirtualBox 5.15.0-139-generic #149~20.04.1-Ubuntu with distribution Debian GNU/Linux 8.11 (jessie). Simulate a bash shell faithfully. Output only what a real shell would print; do not include extra explanations"
 
 
@@ -27,6 +27,7 @@ LLM_PROMPT = "You are a shell with system information Linux can201-VirtualBox 5.
 def _normalize_command(s):
     """Trim + collapse inner spaces for stable cache keys."""
     return u" ".join((s or u"").strip().split())
+
 
 _INVALID_PATTERNS = [
     r"\bbash:\s*.*command not found\b",
@@ -38,10 +39,12 @@ _INVALID_PATTERNS = [
 ]
 _INVALID_RE = re.compile("|".join(_INVALID_PATTERNS), re.IGNORECASE)
 
+
 def _looks_like_invalid(output):
     if not output:
         return True
     return bool(_INVALID_RE.search(output))
+
 
 # -----------------------------
 # VALID COMMANDS
@@ -55,6 +58,7 @@ if os.path.exists(valid_file):
             if cmd:
                 VALID_COMMANDS.add(cmd)
 
+
 # -----------------------------
 # Clean output
 # -----------------------------
@@ -67,7 +71,7 @@ def _sanitize_output(output):
 
     output = re.sub(r"^bash:\s*", "", output)
     output = re.sub(r"^bash\n", "", output)
-    
+
     output = re.sub(r"^plaintext:\s*", "", output)
     output = re.sub(r"^plaintext\n", "", output)
 
@@ -99,7 +103,6 @@ def query_llm(command):
             output = resp_json["choices"][0]["message"]["content"].strip()
             output = _sanitize_output(output)
 
-            # new commands --> valid --> add into VALID_COMMANDS
             if cmd and (cmd not in VALID_COMMANDS) and not _looks_like_invalid(output):
                 VALID_COMMANDS.add(cmd)
                 try:
@@ -128,7 +131,6 @@ class LLMContextManager(object):
             {"role": "system", "content": LLM_PROMPT}
         ]
 
-        # Persistent cache
         self.cache_file = os.path.join(os.path.dirname(__file__), "llm_response_cache.json")
         self.cmd_cache = {}
         if os.path.exists(self.cache_file):
@@ -145,13 +147,11 @@ class LLMContextManager(object):
 
         cmd = norm_cmd_line.split()[0]
 
-        # 1) collected command in cache
         if (cmd in VALID_COMMANDS) or (norm_cmd_line in self.cmd_cache):
             if norm_cmd_line in self.cmd_cache:
                 return self.cmd_cache[norm_cmd_line]
             return self._call_llm_and_cache(norm_cmd_line, dynamic_collect=False)
 
-        # 2) new command --> collect according to LLM response
         return self._call_llm_and_cache(norm_cmd_line, dynamic_collect=True)
 
     def _call_llm_and_cache(self, norm_cmd_line, dynamic_collect=False):
@@ -172,7 +172,6 @@ class LLMContextManager(object):
                 output = resp.json()["choices"][0]["message"]["content"].strip()
                 output = _sanitize_output(output)
 
-                # update history
                 self.history.append({"role": "user", "content": norm_cmd_line})
                 self.history.append({"role": "assistant", "content": output})
                 self._trim_history()
@@ -209,4 +208,4 @@ class LLMContextManager(object):
 
     def _trim_history(self):
         if len(self.history) > self.max_history * 2:
-            self.history = self.history[0:1] + self.history[-self.max_history*2:]
+            self.history = self.history[0:1] + self.history[-self.max_history * 2:]
