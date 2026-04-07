@@ -48,16 +48,13 @@ global_blocker = Blocker(
 class amun_reqhandler(asynchat.async_chat):
 
     def __init__(self, divLogger):
+        asynchat.async_chat.__init__(self)
         self.remote_ip = None
         self.remote_port = None
         self.own_ip = None
         self.own_port = None
         self.identifier = None
-        self.in_buffer_size = 1024
-        self.in_buffer = ""
-        self.out_buffer = ""
-        self.connected = True
-        self.set_terminator(None)
+        self.set_terminator(None)  # Important: set terminator before other init
         ### FIXME: configuration file
         self.enableProxy = False
         self.proxytoIP = "127.0.0.1"
@@ -300,26 +297,6 @@ class amun_reqhandler(asynchat.async_chat):
     def handle_error(self):
         raise
 
-    def handle_read(self):
-        try:
-            try:
-                bytes = self.recv(self.in_buffer_size)
-            except socket.error, e:
-                if e[0] == 110:  # Fix: 110 is numeric not string
-                    self.log_obj.log("connection timeout", 9, "warn", False, True)
-                else:
-                    self.log_obj.log("[handle_read] socket error: %s" % (e), 9, "crit", False, True)
-                bytes = ""
-            # DEBUG: Log what we received
-            if bytes:
-                self.log_obj.log("handle_read received %d bytes: %s" % (len(bytes), repr(bytes[:100])), 6, "debug", True, True)
-            else:
-                self.log_obj.log("handle_read received no data - closing connection", 6, "debug", True, True)
-                self.close()  # Explicitly close if no data
-            self.collect_incoming_data(bytes)
-        except KeyboardInterrupt:
-            raise
-
     ### DF: Modified request handler function
     def collect_incoming_data(self, data):
         # DEBUG: Log entry
@@ -334,6 +311,12 @@ class amun_reqhandler(asynchat.async_chat):
                 self.send(reply_message)
             except Exception as e:
                 self.log_obj.log("error sending reply: %s" % str(e), 6, "crit", False, True)
+
+        # ===== FIX: Don't close connection on empty data =====
+        # Empty data means no more data to read NOW, not that connection is closed
+        # Let async_chat handle connection state
+        if len(data) == 0:
+            return
 
         # command processing
         try:
