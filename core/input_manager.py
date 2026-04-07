@@ -36,8 +36,8 @@ def split_commands(cmd):
                 current = ''
                 i += 2
                 continue
-            # ; or |
-            elif char in [';', '|']:
+            # ; or | or \n (newline as command separator)
+            elif char in [';', '|', '\n']:
                 if current.strip():
                     result.append(current.strip())
                 current = ''
