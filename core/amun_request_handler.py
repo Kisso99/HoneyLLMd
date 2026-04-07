@@ -12,28 +12,21 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 You should have received a copy of the GNU General Public License along with this program; if not, see <http://www.gnu.org/licenses/>
 """
 
-
 try:
-	import psyco ; psyco.full()
-	from psyco.classes import *
+    import psyco
+    psyco.full()
+    from psyco.classes import *
 except ImportError:
-	pass
+    pass
 
 import asynchat
-import StringIO
-import traceback
 import time
 import socket
-import sys
-import hashlib
-import os
 import random
 import struct
-from copy import copy
 
 ### core modules
 import shellcode_mgr_core
-import download_core
 import amun_logging
 
 ### DF: import input manager
@@ -51,450 +44,538 @@ global_blocker = Blocker(
     probs_file="core/transition_probabilities_matrix.csv"
 )
 
+
 class amun_reqhandler(asynchat.async_chat):
 
-	def __init__(self, divLogger):
-		self.remote_ip = None
-		self.remote_port = None
-		self.own_ip = None
-		self.own_port = None
-		self.identifier = None
-		self.in_buffer_size = 1024
-		self.in_buffer = ""
-		self.out_buffer = ""
-		self.connected = True
-		self.set_terminator(None)
-		### FIXME: configuration file
-		self.enableProxy = False
-		self.proxytoIP = "127.0.0.1"
-		self.proxyMode = False
-		self.proxyShellcode = []
-		self.proxyReplies = []
-		self.proxyRequests = []
-		self.proxyTimedOut = False
-		self.proxyResult = None
-		self.sendRequest = ""
-		self.log_obj = amun_logging.amun_logging("amun_request_handler", divLogger['requestHandler'])
-		
-		### DF: LLM init
-		self.llm = None
+    def __init__(self, divLogger):
+        self.remote_ip = None
+        self.remote_port = None
+        self.own_ip = None
+        self.own_port = None
+        self.identifier = None
+        self.in_buffer_size = 1024
+        self.in_buffer = ""
+        self.out_buffer = ""
+        self.connected = True
+        self.set_terminator(None)
+        ### FIXME: configuration file
+        self.enableProxy = False
+        self.proxytoIP = "127.0.0.1"
+        self.proxyMode = False
+        self.proxyShellcode = []
+        self.proxyReplies = []
+        self.proxyRequests = []
+        self.proxyTimedOut = False
+        self.proxyResult = None
+        self.sendRequest = ""
+        self.log_obj = amun_logging.amun_logging("amun_request_handler", divLogger['requestHandler'])
 
-		### DF: Blocker init
-		self.blocker = global_blocker
-		self.experiment_logger = ExperimentLogger("logs/experiment.log")
+        ### DF: LLM init
+        self.llm = None
 
-	def __del__(self):
-		pass
+        ### DF: Blocker init - each connection gets its own blocker instance
+        ### but they share the global matrix for learning
+        self.blocker = None  # Will be initialized per-connection
+        self.experiment_logger = ExperimentLogger("logs/experiment.log")
 
-	def __str__(self):
-		return "      .::[Amun - ReqHandler] handling connection %s:%s --> %s:%s (%s) ::."\
-				% (self.remote_ip,self.remote_port,self.own_ip,self.own_port,self.identifier)
+        # ===== Add: Command transition recording variables =====
+        self.attack_ip = None  # Real attack IP from dataset
+        self.cmd_history = []  # Record all command sequences for this IP
+        self.prev_cmd = None   # Previous command (for transition recording)
+        self.tag_parsed = False  # Flag if IP tag is parsed
 
-	def get_existing_connection(self):
-		result = self.currentConnections[self.identifier]
-		vuln_modulList = result[2]
-		newItem = (int(time.time()), self.socket_object, vuln_modulList)
-		self.currentConnections[self.identifier] = newItem
-		return vuln_modulList
+    def __del__(self):
+        pass
 
-	def set_existing_connection(self):
-		vuln_modulList = {}
-		try:
-			v_modules = self.vuln_modules[str(self.own_port)]
-			for modkey in v_modules.keys():
-				init_mod = v_modules[modkey]
-				vuln_modulList[len(vuln_modulList)] = init_mod.vuln()
-			item = (int(time.time()), self.socket_object, vuln_modulList)
-			self.currentConnections[self.identifier] = item
-		except KeyError, e:
-			pass
-		return vuln_modulList
+    def __str__(self):
+        return "      .::[Amun - ReqHandler] handling connection %s:%s --> %s:%s (%s) ::." \
+            % (self.remote_ip, self.remote_port, self.own_ip, self.own_port, self.identifier)
 
-	def update_existing_connection(self, vuln_modulList):
-		newItem = (int(time.time()), self.socket_object, vuln_modulList)
-		self.currentConnections[self.identifier] = newItem
+    def get_existing_connection(self):
+        result = self.currentConnections[self.identifier]
+        vuln_modulList = result[2]
+        newItem = (int(time.time()), self.socket_object, vuln_modulList)
+        self.currentConnections[self.identifier] = newItem
+        return vuln_modulList
 
-	def delete_existing_connection(self):
-		try:
-			if self.currentSockets.has_key(self.identifier):
-				del self.currentSockets[self.identifier]
-			if self.currentConnections.has_key(self.identifier):
-				item = self.currentConnections[self.identifier]
-				del self.currentConnections[self.identifier]
-				if len(item[2])>0:
-					(result,state) = self.handle_vulnerabilities("", item[2])
-					### check for shellcode and start download manager
-					if result['shellresult']!="None":
-						for resEntry in result['shellresult']:
-							if resEntry['result']:
-								### create exploit event
-								event_item = (self.remote_ip,
-										self.remote_port,
-										self.own_ip,
-										self.own_port,
-										result['vuln_modul'],
-										int(time.time()),
-										resEntry)
-								if not self.event_dict['exploit'].has_key(self.identifier):
-									self.event_dict['exploit'][self.identifier] = event_item
-								### attach to download list
-								self.handle_download(resEntry)
-								### attach to successful exploit list
-								if self.blocksucexpl == 1:
-									item_id = str(self.remote_ip)
-									self.event_dict['sucexpl_connections'][item_id] = int(time.time())
-		except KeyboardInterrupt:
-			raise
+    def set_existing_connection(self):
+        vuln_modulList = {}
+        try:
+            v_modules = self.vuln_modules[str(self.own_port)]
+            for modkey in v_modules.keys():
+                init_mod = v_modules[modkey]
+                vuln_modulList[len(vuln_modulList)] = init_mod.vuln()
+            item = (int(time.time()), self.socket_object, vuln_modulList)
+            self.currentConnections[self.identifier] = item
+        except KeyError, e:
+            pass
+        return vuln_modulList
 
+    def update_existing_connection(self, vuln_modulList):
+        newItem = (int(time.time()), self.socket_object, vuln_modulList)
+        self.currentConnections[self.identifier] = newItem
 
-	def setup_remote_connection(self, remote_ip=None):
-		### try to setup connection to a remote system
-		try:
-			self.log_obj.log("establishing proxy socket", 6, "debug", False, True)
-			self.origin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-			self.origin_socket.settimeout(10.0)
-			if remote_ip==None:
-				### connect to other honeypot system
-				self.origin_socket.connect( (self.proxytoIP, self.own_port) )
-			else:
-				### connect to remote attacker
-				self.proxytoIP = self.remote_ip
-				self.origin_socket.connect( (remote_ip, self.own_port) )
-			self.origin_socket.setblocking(0)
-			return True
-		except socket.error, e:
-			self.log_obj.log("proxy connection setup failed: %s" % (e), 6, "crit", True, True)
-			self.handle_close()
-			return False
-		except KeyboardInterrupt:
-			raise
+    def delete_existing_connection(self):
+        try:
+            if self.currentSockets.has_key(self.identifier):
+                del self.currentSockets[self.identifier]
+            if self.currentConnections.has_key(self.identifier):
+                item = self.currentConnections[self.identifier]
+                del self.currentConnections[self.identifier]
+                if len(item[2]) > 0:
+                    (result, state) = self.handle_vulnerabilities("", item[2])
+                    ### check for shellcode and start download manager
+                    if result['shellresult'] != "None":
+                        for resEntry in result['shellresult']:
+                            if resEntry['result']:
+                                ### create exploit event
+                                event_item = (self.remote_ip,
+                                              self.remote_port,
+                                              self.own_ip,
+                                              self.own_port,
+                                              result['vuln_modul'],
+                                              int(time.time()),
+                                              resEntry)
+                                if not self.event_dict['exploit'].has_key(self.identifier):
+                                    self.event_dict['exploit'][self.identifier] = event_item
+                                ### attach to download list
+                                self.handle_download(resEntry)
+                                ### attach to successful exploit list
+                                if self.blocksucexpl == 1:
+                                    item_id = str(self.remote_ip)
+                                    self.event_dict['sucexpl_connections'][item_id] = int(time.time())
+        except KeyboardInterrupt:
+            raise
 
-	def handle_close(self):
-		try:
-			self.connected = False
-			try:
-				self.shutdown(socket.SHUT_RDWR)
-				self.origin_socket.close()
-			except:
-				pass
-			self.close()
-		except KeyboardInterrupt:
-			raise
+    def setup_remote_connection(self, remote_ip=None):
+        ### try to setup connection to a remote system
+        try:
+            self.log_obj.log("establishing proxy socket", 6, "debug", False, True)
+            self.origin_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.origin_socket.settimeout(10.0)
+            if remote_ip == None:
+                ### connect to other honeypot system
+                self.origin_socket.connect((self.proxytoIP, self.own_port))
+            else:
+                ### connect to remote attacker
+                self.proxytoIP = self.remote_ip
+                self.origin_socket.connect((remote_ip, self.own_port))
+            self.origin_socket.setblocking(0)
+            return True
+        except socket.error, e:
+            self.log_obj.log("proxy connection setup failed: %s" % (e), 6, "crit", True, True)
+            self.handle_close()
+            return False
+        except KeyboardInterrupt:
+            raise
 
-	def handle_incoming_connection(self, socket_object, currSockets, currConn, decodersDict, event_dict, config_dict, vuln_modules, divLogger, addr):
-		""" handles incoming connections at first and inits all objects """
-		asynchat.async_chat.__init__(self, socket_object)
-		self.socket_object = socket_object
-		self.divLogger = divLogger
-		self.shellcode_manager = shellcode_mgr_core.shell_mgr(decodersDict, divLogger['shellcode'], config_dict)
-		self.replace_locals = config_dict['replace_locals']
-		self.blocksucexpl = config_dict['block_sucexpl']
-		self.verboseLogging = config_dict['verbose_logging']
-		
-		### DF: init LLM memory as object
-		self.llm = LLMContextManager(MODEL, API_KEY, BASE_URL, max_history=20)
-		
-		try:
-			(self.remote_ip, self.remote_port) = socket_object.getpeername()
-			(self.own_ip, self.own_port) = socket_object.getsockname()
-			self.identifier = "%s%s%s%s" % (self.remote_ip,self.remote_port,self.own_ip,self.own_port)
-		except socket.error, e:
-			### 107: Transport endpoint is not connected
-			if e[0]==107:
-				self.log_obj.log("Transport endpoint is not connected", 6, "crit", False, True)
-			else:
-				self.log_obj.log("[handle_incoming_connection] socket error: %s" % (e), 6, "crit", False, True)
-			### add host to refused list, block connections for 3 minutes
-			if config_dict['block_refused'] == 1:
-				item_id = str(addr[0])
-				event_dict['refused_connections'][item_id] = int(time.time())
-			try:
-				self.shutdown(socket.SHUT_RDWR)
-			except:
-				pass
-			self.connected = False
-			self.close()
-			return
+    def handle_close(self):
+        try:
+            self.connected = False
+            try:
+                self.shutdown(socket.SHUT_RDWR)
+                self.origin_socket.close()
+            except:
+                pass
+            self.close()
+        except KeyboardInterrupt:
+            raise
 
-		if self.connected:
-			self.currentSockets = currSockets
-			self.currentConnections = currConn
-			self.decodersDict = decodersDict
-			self.event_dict = event_dict
-			self.vuln_modules = vuln_modules
-			self.random_reply = self.create_random_reply()
-			### used sockets for timeout in amun server
-			if not self.currentSockets.has_key(self.identifier):
-				self.set_new_socket_connection()
-			### nat or real ip
-			if config_dict['ftp_nat_ip']!="None":
-				self.ownIP = config_dict['ftp_nat_ip']
-			else:
-				self.ownIP = self.own_ip
-			### initial connection event
-			if not event_dict['initial_connections'].has_key(self.identifier):
-				event_dict['initial_connections'][self.identifier] = [self.remote_ip, self.remote_port, self.own_ip, self.own_port, None, 0, int(time.time())]
-			### handle welcome messages
-			self.handle_welcome()
+    def handle_incoming_connection(self, socket_object, currSockets, currConn, decodersDict, event_dict,
+                                   config_dict, vuln_modules, divLogger, addr):
+        """ handles incoming connections at first and inits all objects """
+        asynchat.async_chat.__init__(self, socket_object)
+        self.socket_object = socket_object
+        self.divLogger = divLogger
+        self.shellcode_manager = shellcode_mgr_core.shell_mgr(decodersDict, divLogger['shellcode'], config_dict)
+        self.replace_locals = config_dict['replace_locals']
+        self.blocksucexpl = config_dict['block_sucexpl']
+        self.verboseLogging = config_dict['verbose_logging']
 
-	def handle_welcome(self):
-		### get registered vuln modules for own_port
-		if not self.currentConnections.has_key(self.identifier):
-			vuln_modulList = self.set_existing_connection()
-		else:
-			vuln_modulList = self.get_existing_connection()
+        ### DF: init LLM memory as object
+        self.llm = LLMContextManager()
 
-		welcome_list = []
-		for key in vuln_modulList.keys():
-			vuln_module = vuln_modulList[key]
-			welcome_message = vuln_module.getWelcomeMessage()
-			if len(welcome_message)>0:
-				welcome_list.append( welcome_message )
+        ### DF: init Blocker for this connection (shares global matrix)
+        self.blocker = Blocker(
+            counts_file="core/transition_counts_matrix.csv",
+            probs_file="core/transition_probabilities_matrix.csv"
+        )
 
-		if len(welcome_list)>0:
-			self.log_obj.log("sending welcome message: %s" % ([welcome_list[0]]), 6, "crit", False, False)
-			rplmess = welcome_list[0].replace("root#", '')+"\r\n"
-			try:
-				bytesTosend = len(rplmess)
-				while bytesTosend>0:
-					bytes_sent = self.socket_object.send(rplmess)
-					bytesTosend = bytesTosend - bytes_sent
-					rplmess = rplmess[bytes_sent:]
-			except socket.error, e:
-				self.log_obj.log("[handle_welcome] socket error: %s" % (e), 6, "crit", False, True)
-				self.delete_existing_connection()
-				if self.event_dict['initial_connections'].has_key(self.identifier):
-					del self.event_dict['initial_connections'][self.identifier]
-				self.connected = False
-				self.close()
+        try:
+            (self.remote_ip, self.remote_port) = socket_object.getpeername()
+            (self.own_ip, self.own_port) = socket_object.getsockname()
 
-	def set_new_socket_connection(self):
-		### (0) Timestamp (1) Socket
-		item = (int(time.time()), self.socket_object)
-		self.currentSockets[self.identifier] = item
+            # ===== Parse ATTACK_IP tag (will be processed in collect_incoming_data via asyncore) =====
+            self.attack_ip = self.remote_ip  # Default value
+            self.tag_parsed = False
+            self.identifier = "{}_{}".format(self.attack_ip, self.own_port)
+            self.log_obj.log("Real attack IP: {} | Session ID: {}".format(self.attack_ip, self.identifier), 6, "info",
+                             True, True)
+        except socket.error, e:
+            ### 107: Transport endpoint is not connected
+            if e[0] == 107:
+                self.log_obj.log("Transport endpoint is not connected", 6, "crit", False, True)
+            else:
+                self.log_obj.log("[handle_incoming_connection] socket error: %s" % (e), 6, "crit", False, True)
+            ### add host to refused list, block connections for 3 minutes
+            if config_dict['block_refused'] == 1:
+                item_id = str(addr[0])
+                event_dict['refused_connections'][item_id] = int(time.time())
+            try:
+                self.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            self.connected = False
+            self.close()
+            return
 
-	def handle_connect(self):
-		pass
+        if self.connected:
+            self.currentSockets = currSockets
+            self.currentConnections = currConn
+            self.decodersDict = decodersDict
+            self.event_dict = event_dict
+            self.vuln_modules = vuln_modules
+            self.random_reply = self.create_random_reply()
+            ### used sockets for timeout in amun server
+            if not self.currentSockets.has_key(self.identifier):
+                self.set_new_socket_connection()
+            ### nat or real ip
+            if config_dict['ftp_nat_ip'] != "None":
+                self.ownIP = config_dict['ftp_nat_ip']
+            else:
+                self.ownIP = self.own_ip
+            ### initial connection event
+            if not event_dict['initial_connections'].has_key(self.identifier):
+                event_dict['initial_connections'][self.identifier] = [self.remote_ip, self.remote_port, self.own_ip,
+                                                                      self.own_port, None, 0, int(time.time())]
+            ### handle welcome messages
+            self.handle_welcome()
 
-	def found_terminator(self):
-		pass
+    def handle_welcome(self):
+        ### get registered vuln modules for own_port
+        if not self.currentConnections.has_key(self.identifier):
+            vuln_modulList = self.set_existing_connection()
+        else:
+            vuln_modulList = self.get_existing_connection()
 
-	def handle_expt(self):
-		### out of band data can be ignored
-		pass
+        welcome_list = []
+        for key in vuln_modulList.keys():
+            vuln_module = vuln_modulList[key]
+            welcome_message = vuln_module.getWelcomeMessage()
+            if len(welcome_message) > 0:
+                welcome_list.append(welcome_message)
 
-	def handle_error(self):
-		raise
+        if len(welcome_list) > 0:
+            self.log_obj.log("sending welcome message: %s" % ([welcome_list[0]]), 6, "crit", False, False)
+            rplmess = welcome_list[0].replace("root#", '') + "\r\n"
+            try:
+                bytesTosend = len(rplmess)
+                while bytesTosend > 0:
+                    bytes_sent = self.socket_object.send(rplmess)
+                    bytesTosend = bytesTosend - bytes_sent
+                    rplmess = rplmess[bytes_sent:]
+            except socket.error, e:
+                self.log_obj.log("[handle_welcome] socket error: %s" % (e), 6, "crit", False, True)
+                self.delete_existing_connection()
+                if self.event_dict['initial_connections'].has_key(self.identifier):
+                    del self.event_dict['initial_connections'][self.identifier]
+                self.connected = False
+                self.close()
 
-	def handle_read(self):
-		try:
-			try:
-				bytes = self.recv(self.in_buffer_size)
-			except socket.error, e:
-				if e[0]=="110":
-					self.log_obj.log("connection timeout", 9, "warn", False, True)
-				else:
-					self.log_obj.log("[handle_read] socket error: %s" % (e), 9, "crit", False, True)
-				bytes = ""
-			self.collect_incoming_data( bytes )
-		except KeyboardInterrupt:
-			raise
-                
-                                
-	### DF: Modified request handler function
-	def collect_incoming_data(self, data):
-		vuln_modulList = self.get_existing_connection() if self.currentConnections.has_key(self.identifier) else self.set_existing_connection()
+    def set_new_socket_connection(self):
+        ### (0) Timestamp (1) Socket
+        item = (int(time.time()), self.socket_object)
+        self.currentSockets[self.identifier] = item
 
-		result, state = self.handle_vulnerabilities(data, vuln_modulList)
+    def handle_connect(self):
+        pass
 
-		for reply_message in result.get('replies', []):
-			try:
-				self.send(reply_message)
-			except Exception as e:
-				self.log_obj.log("error sending reply: %s" % str(e), 6, "crit", False, True)
+    def found_terminator(self):
+        pass
 
-		# command processing
-		try:
-			cmd_str = data.decode('utf-8', 'ignore').replace('\r', '')
-			if '\n' in cmd_str:
-				cmd_str = cmd_str.split('\n', 1)[0]
-			cmd_str = cmd_str.strip()
+    def handle_expt(self):
+        ### out of band data can be ignored
+        pass
 
-			if not hasattr(self, 'first_command_ignored'):
-				self.first_command_ignored = True
-				self.log_obj.log("first command ignored for connection %s" % self.identifier, 6, "info", True, True)
-				self.send("root#")
-				return
+    def handle_error(self):
+        raise
 
-			commands = split_commands(cmd_str)
+    def handle_read(self):
+        try:
+            try:
+                bytes = self.recv(self.in_buffer_size)
+            except socket.error, e:
+                if e[0] == 110:  # Fix: 110 is numeric not string
+                    self.log_obj.log("connection timeout", 9, "warn", False, True)
+                else:
+                    self.log_obj.log("[handle_read] socket error: %s" % (e), 9, "crit", False, True)
+                bytes = ""
+            # DEBUG: Log what we received
+            if bytes:
+                self.log_obj.log("handle_read received %d bytes: %s" % (len(bytes), repr(bytes[:100])), 6, "debug", True, True)
+            else:
+                self.log_obj.log("handle_read received no data - closing connection", 6, "debug", True, True)
+                self.close()  # Explicitly close if no data
+            self.collect_incoming_data(bytes)
+        except KeyboardInterrupt:
+            raise
 
-			if commands:
-				if "exit" in [c.lower() for c in commands]:
-					self.close()
-					return
+    ### DF: Modified request handler function
+    def collect_incoming_data(self, data):
+        # DEBUG: Log entry
+        self.log_obj.log("collect_incoming_data called with %d bytes" % len(data), 6, "debug", True, True)
+        vuln_modulList = self.get_existing_connection() if self.currentConnections.has_key(
+            self.identifier) else self.set_existing_connection()
 
-				self.log_obj.log("commands received: %s" % commands, 6, "info", True, True)
+        result, state = self.handle_vulnerabilities(data, vuln_modulList)
 
-				# Blocker layer: process transitions pairwise
-				block_flag = False
-				for cmd in commands:
-					src = self.blocker.matrix.last_command
-					dst = cmd
+        for reply_message in result.get('replies', []):
+            try:
+                self.send(reply_message)
+            except Exception as e:
+                self.log_obj.log("error sending reply: %s" % str(e), 6, "crit", False, True)
 
-					decision = self.blocker.check_and_update(cmd)
+        # command processing
+        try:
+            # ===== FIX: Process any leftover data from in_buffer first =====
+            if hasattr(self, 'in_buffer') and self.in_buffer:
+                # Prepend buffered data to current data
+                # Handle both str and unicode types for Python 2 compatibility
+                try:
+                    if isinstance(self.in_buffer, unicode):
+                        buffered_data = self.in_buffer.encode('utf-8', 'ignore')
+                    else:
+                        buffered_data = self.in_buffer
+                except NameError:
+                    # Python 3 doesn't have unicode type
+                    buffered_data = self.in_buffer.encode('utf-8', 'ignore') if isinstance(self.in_buffer, str) else self.in_buffer
+                data = buffered_data + data
+                self.in_buffer = ""  # Clear buffer after use
 
-					# Log experiment data
-					self.experiment_logger.log_transition(
-						connection_id=self.identifier,
-						src=src,
-						dst=dst,
-						Pr_Actual=decision.get("Pr_Actual"),
-						Pr_Max=decision.get("Pr_Max"),
-						payoff=decision.get("payoff"),
-						block=decision.get("block"),
-						commands_raw=cmd_str
-					)
+            cmd_str = data.decode('utf-8', 'ignore').replace('\r', '')
+            #if '\n' in cmd_str:
+                #cmd_str = cmd_str.split('\n', 1)[0]
+            cmd_str = cmd_str.strip()
 
-					self.log_obj.log("blocker decision for (%s): %s" % (cmd, decision), 6, "debug", True, True)
-					if decision["block"]:
-						block_flag = True
+            # ===== Skip unparsed IP tag only =====
+            if cmd_str.startswith("ATTACK_IP:") and not self.tag_parsed:
+                self.log_obj.log("Skip IP tag command: %s" % cmd_str, 6, "debug", True, True)
+                self.tag_parsed = True  # Mark as parsed
+                self.first_command_ignored = True  # Mark first command as ignored
+                self.send("root#")
+                return
 
-				# Reply layer
-				if block_flag:
-					out = "permission denied\nroot#"
-				else:
-					llm_input = "; ".join(commands)
-					self.log_obj.log("LLM input (combined): %s" % llm_input, 6, "debug", True, True)
-					llm_reply = self.llm.ask(llm_input)
-					out = (llm_reply + "root#") if llm_reply else "root#"
+            if not hasattr(self, 'first_command_ignored'):
+                self.log_obj.log("first command ignored for connection %s" % self.identifier, 6, "info", True, True)
+                self.first_command_ignored = True  # FIX: Set flag so subsequent commands are processed
+                self.send("root#")
+                return
 
-				try:
-					self.send(out.encode('utf-8', 'ignore'))
-				except:
-					self.send(out)
-			else:
-				self.send("root#")
+            # ===== Parse command and record transition =====
+            commands = split_commands(cmd_str)
 
-		except UnicodeDecodeError:
-			pass
+            if commands:
+                if "exit" in [c.lower() for c in commands]:
+                    self.close()
+                    return
 
-		# 5. Update connection status
-		if state == "amun_stage_finished" and result['shellresult'] != "None":
-			self.close_when_done()
-		else:
-			self.update_existing_connection(vuln_modulList)
-			self.set_new_socket_connection()
+                # ===== Core: Record command transition =====
+                for cmd in commands:
+                    # 1. Add current command to history
+                    self.cmd_history.append(cmd)
+                    # 2. Record command transition (previous → current)
+                    if self.prev_cmd is not None:
+                        # Print transition log (core requirement, Python2 compatible)
+                        self.log_obj.log(
+                            "IP %s Command transition: %s → %s" % (self.attack_ip, self.prev_cmd, cmd),
+                            6, "info", True, True
+                        )
+                        # Record to experiment log (associate with real IP)
+                        self.experiment_logger.log_transition(
+                            connection_id=self.attack_ip,  # Use real IP as connection ID
+                            src=self.prev_cmd,
+                            dst=cmd,
+                            Pr_Actual=None,
+                            Pr_Max=None,
+                            payoff=0.0,
+                            block=False,
+                            commands_raw=cmd_str
+                        )
+                    # 3. Update previous command
+                    self.prev_cmd = cmd
 
+                # ===== Keep original log, add real IP (Python2 compatible) =====
+                self.log_obj.log("IP %s Received command: %s" % (self.attack_ip, commands), 6, "info", True, True)
 
-	def create_random_reply(self):
-		random_reply = []
-		random_reply = [struct.pack("B", random.randint(0,255)) for i in xrange(0,62)]
-		return random_reply
+                # Blocker layer: process transitions pairwise
+                block_flag = False
+                for cmd in commands:
+                    src = self.blocker.matrix.last_command
+                    dst = cmd
 
-	def handle_vulnerabilities(self, data, vuln_modulList):
-		try:
-			keysToRemove = []
-			state = "amun_not_set"
-			result =  {}
-			result['replies'] = []
-			result['shellresult'] = "None"
-			result['vuln_modul'] = "None"
-			result['stage_list'] = []
+                    decision = self.blocker.check_and_update(cmd)
 
-			for key in vuln_modulList.keys():
-				vuln_modul = vuln_modulList[key]
-				vulnResult = vuln_modul.incoming(data, len(data), self.remote_ip, self.divLogger['vulnerability'], self.random_reply, self.ownIP)
-				### not accepted -> remove from vuln list
-				if not vulnResult['accept']:
-					self.log_obj.log("%s leaving communication (stage: %s bytes: %s)" % (vulnResult['vulnname'],vulnResult['stage'],len(data)), 6, "debug", False, False)
-					result['stage_list'].append(vulnResult['stage'])
-					keysToRemove.append(key)
-				else:
-					#print "SHELLCODE --> %s" % len(vulnResult['shellcode'])
-					### if result true and we have a reply -> send reply
-					if vulnResult['result'] and vulnResult['reply']!="None":
-						if vulnResult['reply'].endswith('#'):
-							rplmess = "%s" % (vulnResult['reply'])
-						if vulnResult['reply'].endswith('*'):
-							rplmess = "%s" % (vulnResult['reply'][:-1])
-						else:
-							rplmess = "%s\r\n" % (vulnResult['reply'])
-						if rplmess not in result['replies']:
-							result['replies'].append(rplmess)
-					### if result false, shellcode present and not a direct file -> run shellcode manager
-					if not vulnResult['result'] and vulnResult['shellcode']!="None" and not vulnResult['isFile']:
-						result['shellresult'] = self.handle_shellcode(vulnResult)
-						result['vuln_modul'] = vulnResult['vulnname']
-						state = "amun_stage_finished"
-						break
-					### if result false, shellcode present but a direct file -> add to download list
-					if not vulnResult['result'] and vulnResult['shellcode']!="None" and vulnResult['isFile']:
-						self.log_obj.log("Vuln: %s requested file check" % (vulnResult['vulnname']), 6, "crit", False, False)
-						data = vulnResult['shellcode']
-						data_len = len(data)
-						if data_len>0:
-							downURL = "%s://%s:%s/" % (vulnResult['vulnname'].replace(' Vulnerability','').lower(), self.remote_ip, self.remote_port)
-							self.createFileEvent(data, data_len, vulnResult['vulnname'], downURL)
-							result['shellresult'] = [self.setMyDoomShellResult(downURL)]
-							result['vuln_modul'] = vulnResult['vulnname']
-						state = "amun_stage_finished"
-						break
-					### check for requested connection shutdown
-					if vulnResult['shutdown']:
-						self.log_obj.log("%s requested shutdown" % (vulnResult['vulnname']), 6, "crit", False, True)
-						self.delete_existing_connection()
-						try:
-							self.shutdown(socket.SHUT_RDWR)
-						except:
-							pass
-						if self.event_dict['initial_connections'].has_key(self.identifier):
-							del self.event_dict['initial_connections'][self.identifier]
-						self.connected = False
-						self.close()
-					### set state
-					state = "amun_stage_finished"
-			### remove entries
-			for key in keysToRemove:
-				del vuln_modulList[key]
-			del keysToRemove
-			return result,state
-		except KeyboardInterrupt:
-			raise
-		except:
-			print "Port: %s" % (self.own_port)
-			raise
+                    # ===== Associate experiment log with real IP =====
+                    self.experiment_logger.log_transition(
+                        connection_id=self.attack_ip,  # Replace with real attack IP
+                        src=src,
+                        dst=dst,
+                        Pr_Actual=decision.get("Pr_Actual"),
+                        Pr_Max=decision.get("Pr_Max"),
+                        payoff=decision.get("payoff"),
+                        block=decision.get("block"),
+                        commands_raw=cmd_str
+                    )
 
-	def setMyDoomShellResult(self, downURL):
-		resultSet = {}
-		resultSet['vulnname'] = 'MYDOOM'
-		resultSet['result'] = True
-		resultSet['hostile_host'] = self.remote_ip
-		resultSet['own_host'] = self.own_ip
-		resultSet['found'] = "mydoom"
-		resultSet['path'] = "None"
-		resultSet['host'] = "None"
-		resultSet['port'] = "None"
-		resultSet['xorkey'] = "None"
-		resultSet['username'] = "None"
-		resultSet['passwort'] = "None"
-		resultSet['dlident'] = "%s%s" % (self.remote_ip.replace('.',''), self.remote_port)
-		resultSet['displayURL'] = downURL
-		resultSet['isLocalIP'] = False
-		resultSet['shellcodeName'] = "mydoom"
-		return resultSet
+                    # Python2 compatible log format
+                    self.log_obj.log("IP %s Block decision (%s): %s" % (self.attack_ip, cmd, decision), 6, "debug", True,
+                                     True)
+                    if decision["block"]:
+                        block_flag = True
 
-	def handle_shellcode(self, vulnResult):
-		try:
-			return self.shellcode_manager.start_matching( vulnResult, self.remote_ip, self.own_ip, self.own_port, self.replace_locals, False )
-		except KeyboardInterrupt:
-			raise
+                # Reply layer
+                if block_flag:
+                    out = "permission denied\nroot#"
+                else:
+                    llm_input = "; ".join(commands)
+                    # Python2 compatible log format
+                    self.log_obj.log("IP %s LLM input: %s" % (self.attack_ip, llm_input), 6, "debug", True, True)
+                    llm_reply = self.llm.ask(llm_input)
+                    out = (llm_reply + "root#") if llm_reply else "root#"
 
-	def handle_download(self, result):
-		### attach to download events
-		if not self.event_dict['download'].has_key(result['dlident']):
-			self.event_dict['download'][result['dlident']] = result
+                try:
+                    self.send(out.encode('utf-8', 'ignore'))
+                except:
+                    self.send(out)
+            else:
+                self.send("root#")
 
-	def createFileEvent(self, file_data, file_data_length, vulnname, downURL):
-		event_item = (file_data_length, self.remote_ip, self.remote_port, self.own_ip, "MyDOOM", file_data, vulnname, downURL)
-		id = "%s%s" % (self.remote_ip.replace('.',''), self.own_port)
-		self.event_dict['successfull_downloads'][id] = event_item
+        except UnicodeDecodeError:
+            pass
+
+        # 5. Update connection status
+        if state == "amun_stage_finished" and result['shellresult'] != "None":
+            self.close_when_done()
+        else:
+            self.update_existing_connection(vuln_modulList)
+            self.set_new_socket_connection()
+
+    def create_random_reply(self):
+        random_reply = []
+        random_reply = [struct.pack("B", random.randint(0, 255)) for i in xrange(0, 62)]
+        return random_reply
+
+    def handle_vulnerabilities(self, data, vuln_modulList):
+        try:
+            keysToRemove = []
+            state = "amun_not_set"
+            result = {}
+            result['replies'] = []
+            result['shellresult'] = "None"
+            result['vuln_modul'] = "None"
+            result['stage_list'] = []
+
+            for key in vuln_modulList.keys():
+                vuln_modul = vuln_modulList[key]
+                vulnResult = vuln_modul.incoming(data, len(data), self.remote_ip, self.divLogger['vulnerability'],
+                                                 self.random_reply, self.ownIP)
+                ### not accepted -> remove from vuln list
+                if not vulnResult['accept']:
+                    self.log_obj.log("%s leaving communication (stage: %s bytes: %s)" % (
+                        vulnResult['vulnname'], vulnResult['stage'], len(data)), 6, "debug", False, False)
+                    result['stage_list'].append(vulnResult['stage'])
+                    keysToRemove.append(key)
+                else:
+                    # print "SHELLCODE --> %s" % len(vulnResult['shellcode'])
+                    ### if result true and we have a reply -> send reply
+                    if vulnResult['result'] and vulnResult['reply'] != "None":
+                        if vulnResult['reply'].endswith('#'):
+                            rplmess = "%s" % (vulnResult['reply'])
+                        elif vulnResult['reply'].endswith('*'):  # Fix: Use elif to avoid duplicate assignment
+                            rplmess = "%s" % (vulnResult['reply'][:-1])
+                        else:
+                            rplmess = "%s\r\n" % (vulnResult['reply'])
+                        if rplmess not in result['replies']:
+                            result['replies'].append(rplmess)
+                    ### if result false, shellcode present and not a direct file -> run shellcode manager
+                    if not vulnResult['result'] and vulnResult['shellcode'] != "None" and not vulnResult['isFile']:
+                        result['shellresult'] = self.handle_shellcode(vulnResult)
+                        result['vuln_modul'] = vulnResult['vulnname']
+                        state = "amun_stage_finished"
+                        break
+                    ### if result false, shellcode present but a direct file -> add to download list
+                    if not vulnResult['result'] and vulnResult['shellcode'] != "None" and vulnResult['isFile']:
+                        self.log_obj.log("Vuln: %s requested file check" % (vulnResult['vulnname']), 6, "crit", False,
+                                         False)
+                        data = vulnResult['shellcode']
+                        data_len = len(data)
+                        if data_len > 0:
+                            downURL = "%s://%s:%s/" % (
+                                vulnResult['vulnname'].replace(' Vulnerability', '').lower(), self.remote_ip,
+                                self.remote_port)
+                            self.createFileEvent(data, data_len, vulnResult['vulnname'], downURL)
+                            result['shellresult'] = [self.setMyDoomShellResult(downURL)]
+                            result['vuln_modul'] = vulnResult['vulnname']
+                        state = "amun_stage_finished"
+                        break
+                    ### check for requested connection shutdown
+                    if vulnResult['shutdown']:
+                        self.log_obj.log("%s requested shutdown" % (vulnResult['vulnname']), 6, "crit", False, True)
+                        self.delete_existing_connection()
+                        try:
+                            self.shutdown(socket.SHUT_RDWR)
+                        except:
+                            pass
+                        if self.event_dict['initial_connections'].has_key(self.identifier):
+                            del self.event_dict['initial_connections'][self.identifier]
+                        self.connected = False
+                        self.close()
+                    ### set state
+                    state = "amun_stage_finished"
+            ### remove entries
+            for key in keysToRemove:
+                del vuln_modulList[key]
+            del keysToRemove
+            return result, state
+        except KeyboardInterrupt:
+            raise
+        except:
+            print "Port: %s" % (self.own_port)
+            raise
+
+    def setMyDoomShellResult(self, downURL):
+        resultSet = {}
+        resultSet['vulnname'] = 'MYDOOM'
+        resultSet['result'] = True
+        resultSet['hostile_host'] = self.remote_ip
+        resultSet['own_host'] = self.own_ip
+        resultSet['found'] = "mydoom"
+        resultSet['path'] = "None"
+        resultSet['host'] = "None"
+        resultSet['port'] = "None"
+        resultSet['xorkey'] = "None"
+        resultSet['username'] = "None"
+        resultSet['passwort'] = "None"
+        resultSet['dlident'] = "%s%s" % (self.remote_ip.replace('.', ''), self.remote_port)
+        resultSet['displayURL'] = downURL
+        resultSet['isLocalIP'] = False
+        resultSet['shellcodeName'] = "mydoom"
+        return resultSet
+
+    def handle_shellcode(self, vulnResult):
+        try:
+            return self.shellcode_manager.start_matching(vulnResult, self.remote_ip, self.own_ip, self.own_port,
+                                                         self.replace_locals, False)
+        except KeyboardInterrupt:
+            raise
+
+    def handle_download(self, result):
+        ### attach to download events
+        if not self.event_dict['download'].has_key(result['dlident']):
+            self.event_dict['download'][result['dlident']] = result
+
+    def createFileEvent(self, file_data, file_data_length, vulnname, downURL):
+        event_item = (
+            file_data_length, self.remote_ip, self.remote_port, self.own_ip, "MyDOOM", file_data, vulnname, downURL)
+        id = "%s%s" % (self.remote_ip.replace('.', ''), self.own_port)
+        self.event_dict['successfull_downloads'][id] = event_item
