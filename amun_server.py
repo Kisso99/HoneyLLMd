@@ -27,7 +27,6 @@ import socket
 import traceback
 import StringIO
 import time
-import select
 import logging
 import logging.handlers
 import gc
@@ -1115,6 +1114,7 @@ if __name__ == '__main__':
     import amun_bindport_core
     import shellcode_mgr_core
     import utils
+
 
     (opts, args) = readOptions()
     art = """
